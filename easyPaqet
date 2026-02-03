@@ -1,0 +1,1108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+ROLE=""
+ACTION=""
+PACKAGE_URL=""
+CONFIG_PATH="/root/paqet-hub/config.yaml"
+SERVICE_PATH="/etc/systemd/system/paqet.service"
+PORT="444"
+SOCKS_PORT="1080"
+IFACE=""
+LOCAL_IP=""
+ROUTER_MAC=""
+PEER_IP=""
+KCP_KEY=""
+MTU=""
+APPLY_TUNING="false"
+NO_DOWNLOAD="false"
+LOCAL_ARCHIVE=""
+DOWNLOAD_TIMEOUT="0"
+LOG_LINES="100"
+INTERACTIVE="false"
+RUN_CONFIG_AFTER_INSTALL="false"
+APPLY_FIREWALL_AFTER_CONFIG="false"
+START_SERVICE_AFTER_CONFIG="false"
+RUN_TEST_AFTER_CONFIG="false"
+PURGE="false"
+
+info() {
+  echo "[paqet] $*"
+}
+
+prompt() {
+  local label="$1"
+  local default_value="$2"
+  local value=""
+  if [ -n "$default_value" ]; then
+    read -r -p "$label [$default_value]: " value
+    echo "${value:-$default_value}"
+  else
+    read -r -p "$label: " value
+    echo "$value"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME <action> [options]
+  $SCRIPT_NAME            # interactive menu
+
+Actions:
+  install         Download/extract package, install service, enable it
+  configure       Update config values for the selected role
+  start|stop|restart|status
+  logs            Follow service logs (journalctl)
+  firewall-apply  Add iptables rules (server only)
+  firewall-clean  Remove iptables rules (server only)
+  uninstall       Disable service and remove files
+
+Options:
+  --role client|server   Required for install/configure (client=Iran, server=Kharej)
+  --local-archive PATH   Use local tar.gz instead of downloading
+  --package-url URL      Override package URL for install
+  --no-download          Skip download/extract (use existing /root/paqet-hub)
+  --purge                Remove easyPaqet script and tuning file
+  --download-timeout SEC Max seconds per download attempt (0 disables)
+  --iface IFACE          Network interface name (default: auto-detect)
+  --local-ip IP          Local server IP (default: auto-detect)
+  --router-mac MAC       Router MAC (default: auto-detect)
+  --peer-ip IP           Peer/server IP (client only)
+  --port PORT            Listen/peer port (default: 444)
+  --socks-port PORT      Socks5 listen port (client only, default: 1080)
+  --kcp-key KEY          KCP key (optional)
+  --mtu MTU              KCP MTU (optional)
+  --apply-tuning         Apply sysctl and txqueuelen tuning
+  --config-path PATH     Override config path
+  --service-path PATH    Override systemd service path
+  --log-lines N          Number of log lines for logs action (default: 100)
+
+Examples:
+  $SCRIPT_NAME install --role server
+  $SCRIPT_NAME configure --role server --iface eth0 --local-ip 5.1.2.3 --router-mac aa:bb:cc:dd:ee:ff
+  $SCRIPT_NAME configure --role client --peer-ip 5.1.2.3
+  $SCRIPT_NAME restart
+  $SCRIPT_NAME firewall-apply --role server --port 444
+  $SCRIPT_NAME firewall-clean --role server --port 444
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    die "Run as root."
+  fi
+}
+
+parse_args() {
+  if [ "$#" -lt 1 ]; then
+    INTERACTIVE="true"
+    return
+  fi
+
+  ACTION="$1"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --role)
+        ROLE="$2"; shift 2 ;;
+      --package-url)
+        PACKAGE_URL="$2"; shift 2 ;;
+      --local-archive)
+        LOCAL_ARCHIVE="$2"; shift 2 ;;
+      --no-download)
+        NO_DOWNLOAD="true"; shift ;;
+      --purge)
+        PURGE="true"; shift ;;
+      --iface)
+        IFACE="$2"; shift 2 ;;
+      --local-ip)
+        LOCAL_IP="$2"; shift 2 ;;
+      --router-mac)
+        ROUTER_MAC="$2"; shift 2 ;;
+      --peer-ip)
+        PEER_IP="$2"; shift 2 ;;
+      --port)
+        PORT="$2"; shift 2 ;;
+      --socks-port)
+        SOCKS_PORT="$2"; shift 2 ;;
+      --kcp-key)
+        KCP_KEY="$2"; shift 2 ;;
+      --mtu)
+        MTU="$2"; shift 2 ;;
+      --apply-tuning)
+        APPLY_TUNING="true"; shift ;;
+      --config-path)
+        CONFIG_PATH="$2"; shift 2 ;;
+      --service-path)
+        SERVICE_PATH="$2"; shift 2 ;;
+      --download-timeout)
+        DOWNLOAD_TIMEOUT="$2"; shift 2 ;;
+      --log-lines)
+        LOG_LINES="$2"; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+normalize_role() {
+  if [ -z "$ROLE" ]; then
+    return
+  fi
+  local normalized
+  normalized="$(printf "%s" "$ROLE" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    iran)
+      ROLE="client" ;;
+    kharej)
+      ROLE="server" ;;
+    client|server)
+      ROLE="$normalized" ;;
+  esac
+}
+
+is_valid_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local o1 o2 o3 o4
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    if ! [[ "$o" =~ ^[0-9]+$ ]] || [ "$o" -gt 255 ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+is_valid_mac() {
+  [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+is_valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+validate_config_values() {
+  [ -n "$IFACE" ] || die "Interface is required."
+  is_valid_ip "$LOCAL_IP" || die "Invalid local IP."
+  is_valid_mac "$ROUTER_MAC" || die "Invalid router MAC."
+  is_valid_port "$PORT" || die "Invalid port."
+  if [ "$ROLE" = "client" ]; then
+    [ -n "$PEER_IP" ] || die "Peer (server) IP is required for client."
+    is_valid_ip "$PEER_IP" || die "Invalid peer (server) IP."
+    is_valid_port "$SOCKS_PORT" || die "Invalid socks port."
+  fi
+}
+
+print_config_summary() {
+  echo "Configuration summary:"
+  echo "  role: $ROLE"
+  echo "  interface: $IFACE"
+  echo "  local ip: $LOCAL_IP"
+  echo "  router mac: $ROUTER_MAC"
+  echo "  port: $PORT"
+  if [ "$ROLE" = "client" ]; then
+    echo "  peer ip: $PEER_IP"
+    echo "  socks port: $SOCKS_PORT"
+  fi
+  echo "  apply tuning: $APPLY_TUNING"
+}
+
+confirm_config() {
+  local answer
+  answer="$(prompt_yes_no "Proceed with these settings? (yes/no)" "yes")"
+  [ "$answer" = "yes" ]
+}
+
+collect_config_prompts() {
+  local auto_iface
+  auto_iface="$(ip route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)"
+  while :; do
+    if [ -n "$auto_iface" ]; then
+      IFACE="$(prompt "Interface" "$auto_iface")"
+    else
+      IFACE="$(prompt "Interface" "")"
+    fi
+    if [ -n "$IFACE" ]; then
+      break
+    fi
+    echo "Interface is required."
+  done
+
+  local detected_ip
+  detected_ip="$(ip -4 addr show dev "${IFACE:-}" 2>/dev/null | awk '/inet / {print $2}' | head -n1 | cut -d/ -f1)"
+  while :; do
+    if [ -n "$detected_ip" ]; then
+      LOCAL_IP="$(prompt "Local IP" "$detected_ip")"
+    else
+      LOCAL_IP="$(prompt "Local IP" "")"
+    fi
+    if is_valid_ip "$LOCAL_IP"; then
+      break
+    fi
+    echo "Invalid local IP."
+  done
+
+  local gw detected_mac
+  gw="$(ip route show default 2>/dev/null | awk '{print $3}' | head -n1)"
+  detected_mac="$(ip neigh show "$gw" 2>/dev/null | awk '{print $5; exit}')"
+  while :; do
+    if [ -n "$detected_mac" ]; then
+      ROUTER_MAC="$(prompt "Router MAC" "$detected_mac")"
+    else
+      ROUTER_MAC="$(prompt "Router MAC" "")"
+    fi
+    if is_valid_mac "$ROUTER_MAC"; then
+      break
+    fi
+    echo "Invalid router MAC."
+  done
+
+  while :; do
+    PORT="$(prompt "Port" "$PORT")"
+    if is_valid_port "$PORT"; then
+      break
+    fi
+    echo "Invalid port."
+  done
+
+  if [ "$ROLE" = "client" ]; then
+    while :; do
+      PEER_IP="$(prompt "Peer (server) IP" "")"
+      if is_valid_ip "$PEER_IP"; then
+        break
+      fi
+      echo "Peer (server) IP is required and must be valid."
+    done
+    while :; do
+      SOCKS_PORT="$(prompt "Socks5 port" "$SOCKS_PORT")"
+      if is_valid_port "$SOCKS_PORT"; then
+        break
+      fi
+      echo "Invalid socks port."
+    done
+  fi
+
+  local tuning_choice
+  tuning_choice="$(prompt_yes_no "Apply tuning? (yes/no)" "no")"
+  if [ "$tuning_choice" = "yes" ]; then
+    APPLY_TUNING="true"
+  fi
+}
+
+prompt_config_flow() {
+  while :; do
+    collect_config_prompts
+    validate_config_values
+    print_config_summary
+    if confirm_config; then
+      break
+    fi
+    local retry
+    retry="$(prompt_yes_no "Re-enter values? (yes/no)" "yes")"
+    if [ "$retry" != "yes" ]; then
+      die "Cancelled by user."
+    fi
+  done
+}
+
+prompt_yes_no() {
+  local label="$1"
+  local default_value="$2"
+  local value=""
+  while :; do
+    value="$(prompt "$label" "$default_value")"
+    case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
+      yes|y)
+        echo "yes"; return 0 ;;
+      no|n)
+        echo "no"; return 0 ;;
+    esac
+    echo "Please answer yes or no."
+  done
+}
+
+prompt_archive_path() {
+  local path
+  while :; do
+    path="$(prompt "Local archive path (empty to download)" "")"
+    if [ -z "$path" ]; then
+      echo ""
+      return 0
+    fi
+    if [ -f "$path" ]; then
+      echo "$path"
+      return 0
+    fi
+    echo "Archive not found: $path"
+  done
+}
+
+reset_menu_state() {
+  ROLE=""
+  ACTION=""
+  PACKAGE_URL=""
+  IFACE=""
+  LOCAL_IP=""
+  ROUTER_MAC=""
+  PEER_IP=""
+  KCP_KEY=""
+  MTU=""
+  APPLY_TUNING="false"
+  NO_DOWNLOAD="false"
+  LOCAL_ARCHIVE=""
+  RUN_CONFIG_AFTER_INSTALL="false"
+  APPLY_FIREWALL_AFTER_CONFIG="false"
+  START_SERVICE_AFTER_CONFIG="false"
+  RUN_TEST_AFTER_CONFIG="false"
+  PURGE="false"
+}
+
+interactive_menu() {
+  while :; do
+    reset_menu_state
+    echo "Paqet interactive installer"
+    echo "1) install"
+    echo "2) configure"
+    echo "3) start"
+    echo "4) stop"
+    echo "5) restart"
+    echo "6) status"
+    echo "7) logs"
+    echo "8) firewall-apply"
+    echo "9) firewall-clean"
+    echo "10) uninstall"
+    echo "11) quit"
+    local choice
+    choice="$(prompt "Select action" "1")"
+    case "$choice" in
+      1) ACTION="install" ;;
+      2) ACTION="configure" ;;
+      3) ACTION="start" ;;
+      4) ACTION="stop" ;;
+      5) ACTION="restart" ;;
+      6) ACTION="status" ;;
+      7) ACTION="logs" ;;
+      8) ACTION="firewall-apply" ;;
+      9) ACTION="firewall-clean" ;;
+      10) ACTION="uninstall" ;;
+      11) return ;;
+      *) die "Invalid selection." ;;
+    esac
+
+    if [ "$ACTION" = "install" ] || [ "$ACTION" = "configure" ] || [ "$ACTION" = "firewall-apply" ] || [ "$ACTION" = "firewall-clean" ]; then
+    local role_choice
+    role_choice="$(prompt "Role (client=Iran / server=Kharej)" "server")"
+    ROLE="$role_choice"
+    normalize_role
+    fi
+
+    if [ "$ACTION" = "install" ]; then
+    local local_archive_path
+    local_archive_path="$(prompt_archive_path)"
+    if [ -n "$local_archive_path" ]; then
+      LOCAL_ARCHIVE="$local_archive_path"
+      NO_DOWNLOAD="true"
+    fi
+
+    if [ -z "$LOCAL_ARCHIVE" ]; then
+      local use_download
+      use_download="$(prompt_yes_no "Download package? (yes/no)" "yes")"
+      if [ "$use_download" != "yes" ]; then
+        NO_DOWNLOAD="true"
+      fi
+    fi
+
+    local configure_now
+    configure_now="$(prompt_yes_no "Configure now? (yes/no)" "yes")"
+    if [ "$configure_now" = "yes" ]; then
+      RUN_CONFIG_AFTER_INSTALL="true"
+      prompt_config_flow
+    fi
+
+      # Post-config actions are prompted after install/configure completes.
+    fi
+
+    if [ "$ACTION" = "configure" ]; then
+      normalize_role
+      prompt_config_flow
+
+      if [ "$ROLE" = "server" ]; then
+        local apply_fw
+        apply_fw="$(prompt_yes_no "Apply firewall rules now? (yes/no)" "no")"
+        if [ "$apply_fw" = "yes" ]; then
+          APPLY_FIREWALL_AFTER_CONFIG="true"
+        fi
+      fi
+
+      local start_now
+      start_now="$(prompt_yes_no "Start service now? (yes/no)" "no")"
+      if [ "$start_now" = "yes" ]; then
+        START_SERVICE_AFTER_CONFIG="true"
+      fi
+
+      if [ "$ROLE" = "client" ]; then
+        local test_now
+        test_now="$(prompt_yes_no "Test connection now? (yes/no)" "no")"
+        if [ "$test_now" = "yes" ]; then
+          RUN_TEST_AFTER_CONFIG="true"
+        fi
+      fi
+    fi
+
+    if [ "$ACTION" = "uninstall" ]; then
+      local purge_now
+      purge_now="$(prompt_yes_no "Remove easyPaqet script and tuning file? (yes/no)" "no")"
+      if [ "$purge_now" = "yes" ]; then
+        PURGE="true"
+      fi
+    fi
+
+    run_action
+
+    local again
+    again="$(prompt_yes_no "Back to menu? (yes/no)" "yes")"
+    if [ "$again" != "yes" ]; then
+      return
+    fi
+  done
+}
+
+set_default_package_url() {
+  if [ -n "$PACKAGE_URL" ]; then
+    return
+  fi
+  case "$ROLE" in
+    client)
+      PACKAGE_URL="https://c.linklick.ir/dl/hash/lf6uj5i33beppc8ifnel4y9wwtosuu1p" ;;
+    server)
+      PACKAGE_URL="https://c.linklick.ir/dl/hash/u3lr7owsegplrkol7guzqitl8xnepxjk" ;;
+    *)
+      die "--role client|server is required." ;;
+  esac
+}
+
+detect_iface() {
+  if [ -n "$IFACE" ]; then
+    return
+  fi
+  IFACE="$(ip route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)"
+  if [ -z "$IFACE" ]; then
+    die "Unable to detect default interface. Use --iface."
+  fi
+}
+
+detect_local_ip() {
+  if [ -n "$LOCAL_IP" ]; then
+    return
+  fi
+  LOCAL_IP="$(ip -4 addr show dev "$IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -n1 | cut -d/ -f1)"
+  if [ -z "$LOCAL_IP" ]; then
+    die "Unable to detect local IP. Use --local-ip."
+  fi
+}
+
+detect_router_mac() {
+  if [ -n "$ROUTER_MAC" ]; then
+    return
+  fi
+  local gw
+  gw="$(ip route show default 2>/dev/null | awk '{print $3}' | head -n1)"
+  if [ -z "$gw" ]; then
+    die "Unable to detect default gateway. Use --router-mac."
+  fi
+  ROUTER_MAC="$(ip neigh show "$gw" 2>/dev/null | awk '{print $5; exit}')"
+  if [ -z "$ROUTER_MAC" ]; then
+    ROUTER_MAC="$(arp -n "$gw" 2>/dev/null | awk 'NR==2 {print $3}')"
+  fi
+  if [ -z "$ROUTER_MAC" ]; then
+    die "Unable to detect router MAC. Use --router-mac."
+  fi
+}
+
+apply_tuning() {
+  if [ "$APPLY_TUNING" != "true" ]; then
+    return
+  fi
+  cat <<EOF > /etc/sysctl.d/99-max-performance.conf
+net.core.netdev_max_backlog = 250000
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 33554432
+net.core.wmem_default = 33554432
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 30000
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.udp_mem = 65536 131072 262144
+EOF
+  sysctl --system
+  ifconfig "$IFACE" txqueuelen 20000
+}
+
+ensure_package() {
+  if [ "$NO_DOWNLOAD" = "true" ]; then
+    if [ -n "$LOCAL_ARCHIVE" ]; then
+      install_from_archive "$LOCAL_ARCHIVE"
+      return
+    fi
+    if [ ! -d /root/paqet-hub ]; then
+      die "No download selected, but /root/paqet-hub is missing. Provide --local-archive or allow download."
+    fi
+    return
+  fi
+
+  if [ -n "$LOCAL_ARCHIVE" ]; then
+    install_from_archive "$LOCAL_ARCHIVE"
+    return
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "curl or wget is required for download."
+  fi
+
+  set_default_package_url
+  if [ "$ROLE" = "client" ]; then
+    if ! download_to_dir "$PACKAGE_URL" "$tmp_dir"; then
+      if ! download_from_github_latest "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        die "Download failed from mirror and GitHub."
+      fi
+    fi
+  else
+    if ! download_from_github_latest "$tmp_dir"; then
+      if ! download_to_dir "$PACKAGE_URL" "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        die "Download failed from GitHub and mirror."
+      fi
+    fi
+  fi
+
+  local file_path
+  file_path="$(ls -1 "$tmp_dir" | head -n1)"
+  if [ -z "$file_path" ]; then
+    rm -rf "$tmp_dir"
+    die "Download failed."
+  fi
+
+  install_from_archive "$tmp_dir/$file_path"
+
+  rm -rf "$tmp_dir"
+}
+
+download_to_dir() {
+  local url="$1"
+  local dir="$2"
+  local out_file="$dir/package.tar.gz"
+  if command -v curl >/dev/null 2>&1; then
+    local curl_args=("-fL" "--retry" "3" "--retry-delay" "2" "-o" "$out_file")
+    if [ -f "$out_file" ]; then
+      curl_args+=("-C" "-")
+    fi
+    if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
+      curl_args+=("--max-time" "$DOWNLOAD_TIMEOUT")
+    fi
+    curl "${curl_args[@]}" "$url"
+  else
+    local wget_args=("-O" "$out_file")
+    if [ -f "$out_file" ]; then
+      wget_args+=("-c")
+    fi
+    if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
+      wget_args+=("--timeout=$DOWNLOAD_TIMEOUT")
+    fi
+    wget "${wget_args[@]}" "$url"
+  fi
+}
+
+download_from_github_latest() {
+  local dir="$1"
+  local arch
+  arch="$(uname -m)"
+
+  local asset=""
+  case "$arch" in
+    x86_64|amd64)
+      asset="paqet-linux-amd64"
+      ;;
+    aarch64|arm64)
+      asset="paqet-linux-arm64"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  local api_url="https://api.github.com/repos/hanselime/paqet/releases/latest"
+  local download_url=""
+
+  if command -v curl >/dev/null 2>&1; then
+    download_url="$(curl -fsSL "$api_url" | awk -F'"' -v asset="$asset" '
+      /browser_download_url/ && $0 ~ asset && $0 ~ /\.tar\.gz/ {print $4; exit}
+    ')"
+  else
+    download_url="$(wget -qO- "$api_url" | awk -F'"' -v asset="$asset" '
+      /browser_download_url/ && $0 ~ asset && $0 ~ /\.tar\.gz/ {print $4; exit}
+    ')"
+  fi
+
+  if [ -z "$download_url" ]; then
+    return 1
+  fi
+
+  download_to_dir "$download_url" "$dir"
+}
+
+write_service() {
+  cat <<EOF > "$SERVICE_PATH"
+[Unit]
+Description=Paqet Service ($ROLE)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/paqet-hub
+ExecStart=/root/paqet-hub/paqet_linux_amd64 run -c $CONFIG_PATH
+Restart=always
+RestartSec=3
+StartLimitBurst=0
+LimitNOFILE=1000000
+
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=99
+Nice=-20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_from_archive() {
+  local archive_path="$1"
+  [ -f "$archive_path" ] || die "Archive not found: $archive_path"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local extract_dir
+  extract_dir="$tmp_dir/extract"
+  mkdir -p "$extract_dir"
+  tar -xzvf "$archive_path" -C "$extract_dir"
+
+  if [ -d "$extract_dir/root/paqet-hub" ]; then
+    mkdir -p /root
+    cp -a "$extract_dir/root/paqet-hub" /root/
+  elif [ -d "$extract_dir/paqet-hub" ]; then
+    mkdir -p /root
+    cp -a "$extract_dir/paqet-hub" /root/
+  else
+    mkdir -p /root/paqet-hub
+    if [ -f "$extract_dir/paqet_linux_amd64" ]; then
+      cp -a "$extract_dir/paqet_linux_amd64" /root/paqet-hub/
+    fi
+    if [ -d "$extract_dir/example" ]; then
+      cp -a "$extract_dir/example" /root/paqet-hub/
+    fi
+    if [ -f "$extract_dir/README.md" ]; then
+      cp -a "$extract_dir/README.md" /root/paqet-hub/
+    fi
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
+backup_config() {
+  if [ -f "$CONFIG_PATH" ]; then
+    cp "$CONFIG_PATH" "$CONFIG_PATH.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+}
+
+write_config_template() {
+  if [ "$ROLE" = "client" ]; then
+    cat <<EOF > "$CONFIG_PATH"
+role: "client"
+log:
+  level: "error"
+socks5:
+  - listen: "127.0.0.1:$SOCKS_PORT"
+network:
+  interface: "$IFACE"
+  ipv4:
+    addr: "$LOCAL_IP:0"
+    router_mac: "$ROUTER_MAC"
+server:
+  addr: "$PEER_IP:$PORT"
+transport:
+  protocol: "kcp"
+  kcp:
+    block: "none"
+    key: "${KCP_KEY:-y0ur-32-char-very-secret-key-1234}"
+    mtu: ${MTU:-1350}
+    sndwnd: 1024
+    rcvwnd: 1024
+    nodelay: 1
+    interval: 10
+    resend: 1
+    nc: 1
+EOF
+  else
+    cat <<EOF > "$CONFIG_PATH"
+role: "server"
+log:
+  level: "error"
+listen:
+  addr: "0.0.0.0:$PORT"
+network:
+  interface: "$IFACE"
+  ipv4:
+    addr: "$LOCAL_IP:$PORT"
+    router_mac: "$ROUTER_MAC"
+transport:
+  protocol: "kcp"
+  kcp:
+    block: "none"
+    key: "${KCP_KEY:-y0ur-32-char-very-secret-key-1234}"
+    mtu: ${MTU:-1350}
+    sndwnd: 1024
+    rcvwnd: 1024
+    nodelay: 1
+    interval: 10
+    resend: 1
+    nc: 1
+EOF
+  fi
+}
+
+write_placeholder_config() {
+  if [ "$ROLE" = "client" ]; then
+    cat <<EOF > "$CONFIG_PATH"
+role: "client"
+log:
+  level: "error"
+socks5:
+  - listen: "127.0.0.1:$SOCKS_PORT"
+network:
+  interface: "eth0"
+  ipv4:
+    addr: "0.0.0.0:0"
+    router_mac: "00:00:00:00:00:00"
+server:
+  addr: "0.0.0.0:$PORT"
+transport:
+  protocol: "kcp"
+  kcp:
+    block: "none"
+    key: "${KCP_KEY:-y0ur-32-char-very-secret-key-1234}"
+    mtu: ${MTU:-1350}
+    sndwnd: 1024
+    rcvwnd: 1024
+    nodelay: 1
+    interval: 10
+    resend: 1
+    nc: 1
+EOF
+  else
+    cat <<EOF > "$CONFIG_PATH"
+role: "server"
+log:
+  level: "error"
+listen:
+  addr: "0.0.0.0:$PORT"
+network:
+  interface: "eth0"
+  ipv4:
+    addr: "0.0.0.0:$PORT"
+    router_mac: "00:00:00:00:00:00"
+transport:
+  protocol: "kcp"
+  kcp:
+    block: "none"
+    key: "${KCP_KEY:-y0ur-32-char-very-secret-key-1234}"
+    mtu: ${MTU:-1350}
+    sndwnd: 1024
+    rcvwnd: 1024
+    nodelay: 1
+    interval: 10
+    resend: 1
+    nc: 1
+EOF
+  fi
+}
+
+write_evilcu_md() {
+  local content=""
+  if [ "$ROLE" = "client" ]; then
+    content=$'داخل فایل کانفیگ آیپی های خودتون و اسم اینترفیس و مک آدرس سرور رو عوض کنید\n\nt.me/evilcu\nتوضیحات در چنل\n'
+  else
+    content=$'آیپی و اسم اینترفیس و مک آدرس رو ویرایش کنید \nt.me/evilcu\nتوضیحات در چنل\n'
+  fi
+  printf "%s" "$content" > /root/paqet-hub/evilcu.md
+}
+
+ensure_custom_files() {
+  mkdir -p /root/paqet-hub
+  if [ ! -f /root/paqet-hub/evilcu.md ]; then
+    write_evilcu_md
+  fi
+  if [ ! -f "$CONFIG_PATH" ]; then
+    write_placeholder_config
+  fi
+}
+
+replace_line() {
+  local pattern="$1"
+  local replacement="$2"
+  if grep -q "$pattern" "$CONFIG_PATH"; then
+    sed -i "s|$pattern|$replacement|" "$CONFIG_PATH"
+  fi
+}
+
+replace_addr_block() {
+  local key="$1"
+  local addr_value="$2"
+  awk -v key="$key" -v addr="  addr: \"$addr_value\"" '
+    $1 == key":" {print; getline; print addr; next}
+    {print}
+  ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+}
+
+update_config() {
+  backup_config
+
+  if [ ! -f "$CONFIG_PATH" ]; then
+    write_config_template
+    return
+  fi
+
+  replace_line '^role: .*' "role: \"$ROLE\""
+  replace_line '^  interface: .*' "  interface: \"$IFACE\""
+  replace_line '^    addr: .*' "    addr: \"$LOCAL_IP:$PORT\""
+  if [ "$ROLE" = "client" ]; then
+    replace_line '^    addr: .*' "    addr: \"$LOCAL_IP:0\""
+    replace_line '^  - listen: .*' "  - listen: \"127.0.0.1:$SOCKS_PORT\""
+    replace_addr_block "server" "$PEER_IP:$PORT"
+  else
+    replace_addr_block "listen" "0.0.0.0:$PORT"
+  fi
+  replace_line '^    router_mac: .*' "    router_mac: \"$ROUTER_MAC\""
+
+  if [ -n "$KCP_KEY" ]; then
+    replace_line '^    key: .*' "    key: \"$KCP_KEY\""
+  fi
+  if [ -n "$MTU" ]; then
+    replace_line '^    mtu: .*' "    mtu: $MTU"
+  fi
+}
+
+ensure_role() {
+  normalize_role
+  if [ "$ROLE" != "client" ] && [ "$ROLE" != "server" ]; then
+    die "--role client|server is required."
+  fi
+}
+
+install_action() {
+  require_root
+  ensure_role
+  ensure_package
+  ensure_custom_files
+  if [ ! -x /root/paqet-hub/paqet_linux_amd64 ]; then
+    chmod +x /root/paqet-hub/paqet_linux_amd64
+  fi
+  if [ ! -x /root/paqet-hub/paqet_linux_amd64 ]; then
+    die "paqet_linux_amd64 not found in /root/paqet-hub."
+  fi
+  write_service
+  systemctl daemon-reload
+  systemctl enable paqet
+}
+
+configure_action() {
+  require_root
+  ensure_role
+
+  detect_iface
+  detect_local_ip
+  detect_router_mac
+
+  validate_config_values
+
+  update_config
+  apply_tuning
+  systemctl daemon-reload
+}
+
+manage_action() {
+  require_root
+  case "$ACTION" in
+    start|stop|restart|status)
+      systemctl "$ACTION" paqet
+      ;;
+    logs)
+      journalctl -u paqet -n "$LOG_LINES" -f
+      ;;
+    firewall-apply)
+      ensure_role
+      if [ "$ROLE" != "server" ]; then
+        die "firewall-apply is only supported for server role."
+      fi
+      firewall_apply
+      ;;
+    firewall-clean)
+      ensure_role
+      if [ "$ROLE" != "server" ]; then
+        die "firewall-clean is only supported for server role."
+      fi
+      firewall_clean
+      ;;
+    uninstall)
+      uninstall_action
+      ;;
+    *)
+      die "Unknown action: $ACTION"
+      ;;
+  esac
+}
+
+uninstall_action() {
+  systemctl stop paqet || true
+  systemctl disable paqet || true
+  rm -f "$SERVICE_PATH"
+  rm -rf /root/paqet-hub
+  rm -f /etc/sysctl.d/99-max-performance.conf
+  systemctl daemon-reload
+
+  if [ "$PURGE" = "true" ]; then
+    local script_path
+    script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    rm -f "$script_path" || true
+    if [ -f /usr/local/bin/easyPaqet ] && [ "$script_path" != "/usr/local/bin/easyPaqet" ]; then
+      rm -f /usr/local/bin/easyPaqet || true
+    fi
+  fi
+}
+
+run_action() {
+  case "$ACTION" in
+    install)
+      install_action
+      if [ "$RUN_CONFIG_AFTER_INSTALL" = "true" ]; then
+        configure_action
+        if [ "$ROLE" = "server" ]; then
+          local apply_fw
+          apply_fw="$(prompt_yes_no "Apply firewall rules now? (yes/no)" "yes")"
+          if [ "$apply_fw" = "yes" ]; then
+            APPLY_FIREWALL_AFTER_CONFIG="true"
+          fi
+        fi
+
+        local start_now
+        start_now="$(prompt_yes_no "Start service now? (yes/no)" "yes")"
+        if [ "$start_now" = "yes" ]; then
+          START_SERVICE_AFTER_CONFIG="true"
+        fi
+
+        if [ "$ROLE" = "client" ]; then
+          local test_now
+          test_now="$(prompt_yes_no "Test connection now? (yes/no)" "no")"
+          if [ "$test_now" = "yes" ]; then
+            RUN_TEST_AFTER_CONFIG="true"
+          fi
+        fi
+
+        run_post_config_actions
+      else
+        systemctl restart paqet
+        sleep 3
+        if [ "$ROLE" = "client" ]; then
+          test_connection
+        fi
+      fi
+      ;;
+    configure)
+      configure_action
+      run_post_config_actions
+      ;;
+    start|stop|restart|status|logs|firewall-apply|firewall-clean|uninstall)
+      manage_action
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+firewall_apply() {
+  iptables -t raw -C PREROUTING -p tcp --dport "$PORT" -j NOTRACK 2>/dev/null \
+    || iptables -t raw -A PREROUTING -p tcp --dport "$PORT" -j NOTRACK
+  iptables -t raw -C OUTPUT -p tcp --sport "$PORT" -j NOTRACK 2>/dev/null \
+    || iptables -t raw -A OUTPUT -p tcp --sport "$PORT" -j NOTRACK
+  iptables -t mangle -C OUTPUT -p tcp --sport "$PORT" --tcp-flags RST RST -j DROP 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags RST RST -j DROP
+}
+
+firewall_clean() {
+  iptables -t raw -D PREROUTING -p tcp --dport "$PORT" -j NOTRACK 2>/dev/null || true
+  iptables -t raw -D OUTPUT -p tcp --sport "$PORT" -j NOTRACK 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags RST RST -j DROP 2>/dev/null || true
+}
+
+test_connection() {
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not found; cannot test connection."
+    return
+  fi
+  local attempt
+  for attempt in 1 2 3; do
+    info "Testing connection via SOCKS5 (attempt $attempt/3)..."
+    if curl -v --max-time 15 https://google.com --proxy "socks5h://127.0.0.1:$SOCKS_PORT"; then
+      return
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+run_post_config_actions() {
+  if [ "$APPLY_FIREWALL_AFTER_CONFIG" = "true" ] && [ "$ROLE" = "server" ]; then
+    firewall_apply
+  fi
+  if [ "$START_SERVICE_AFTER_CONFIG" = "true" ]; then
+    systemctl start paqet
+  fi
+  systemctl restart paqet
+  sleep 3
+  if [ "$ROLE" = "client" ]; then
+    test_connection
+  elif [ "$RUN_TEST_AFTER_CONFIG" = "true" ]; then
+    systemctl status paqet --no-pager
+  fi
+}
+
+main() {
+  parse_args "$@"
+  normalize_role
+  if [ "$INTERACTIVE" = "true" ]; then
+    interactive_menu
+    return
+  fi
+  run_action
+}
+
+main "$@"

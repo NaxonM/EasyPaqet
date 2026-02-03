@@ -1,0 +1,7 @@
+# Ignore everything by default
+*
+
+# Keep the repo metadata and published files
+!.gitignore
+!README.md
+!easyPaqet
