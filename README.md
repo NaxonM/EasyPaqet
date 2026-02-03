@@ -37,7 +37,6 @@ easyPaqet simplifies the deployment and management of Paqet tunnels, providing a
 Special thanks to Evil (Evilcu) for the original findings and setup documentation:
 
 - Telegram: [@Evilcu](https://t.me/Evilcu)
-- Setup Guide: [t.me/Evilcu/21](https://t.me/Evilcu/21)
 
 **Upstream Project:**
 - [Paqet by hanselime](https://github.com/hanselime/paqet)
