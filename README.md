@@ -59,7 +59,7 @@ Special thanks to Evil (Evilcu) for the original findings and setup documentatio
 Install easyPaqet directly on your VPS with a single command:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/NaxonM/EasyPaqet/main/easyPaqet.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/NaxonM/EasyPaqet/main/easyPaqet)
 ```
 
 ### Role-Specific Installation
