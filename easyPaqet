@@ -31,6 +31,29 @@ info() {
   echo "[paqet] $*"
 }
 
+show_status_badge() {
+  local bin_path="/root/paqet-hub/paqet_linux_amd64"
+  local installed="no"
+  local running="no"
+  local version="not installed"
+
+  if [ -x "$bin_path" ]; then
+    installed="yes"
+    version="$(get_paqet_version)"
+    if [ -z "$version" ]; then
+      version="unknown"
+    fi
+  fi
+
+  if systemctl is-active --quiet paqet 2>/dev/null; then
+    running="yes"
+  fi
+
+  echo "========================================"
+  echo "Status: installed=$installed | running=$running | version=$version"
+  echo "========================================"
+}
+
 prompt() {
   local label="$1"
   local default_value="$2"
@@ -52,6 +75,7 @@ Usage:
 
 Actions:
   install         Download/extract package, install service, enable it
+  update-binary   Update paqet binary from GitHub (keeps config)
   configure       Update config values for the selected role
   start|stop|restart|status
   logs            Follow service logs (journalctl)
@@ -217,6 +241,13 @@ print_config_summary() {
     echo "  socks port: $SOCKS_PORT"
   fi
   echo "  apply tuning: $APPLY_TUNING"
+  local version
+  version="$(get_paqet_version)"
+  if [ -n "$version" ]; then
+    echo "  binary version: $version"
+  else
+    echo "  binary version: not installed"
+  fi
 }
 
 confirm_config() {
@@ -372,32 +403,47 @@ reset_menu_state() {
 interactive_menu() {
   while :; do
     reset_menu_state
-    echo "Paqet interactive installer"
-    echo "1) install"
-    echo "2) configure"
-    echo "3) start"
-    echo "4) stop"
-    echo "5) restart"
-    echo "6) status"
-    echo "7) logs"
-    echo "8) firewall-apply"
-    echo "9) firewall-clean"
-    echo "10) uninstall"
-    echo "11) quit"
+    echo ""
+    echo "========================================"
+    echo "            easyPaqet Menu              "
+    echo "========================================"
+    echo "Install & Update"
+    echo "  1) Install"
+    echo "  2) Update binary (GitHub)"
+    echo ""
+    echo "Configure"
+    echo "  3) Configure"
+    echo ""
+    echo "Service Control"
+    echo "  4) Start"
+    echo "  5) Stop"
+    echo "  6) Restart"
+    echo "  7) Status"
+    echo "  8) Logs"
+    echo ""
+    echo "Firewall (server only)"
+    echo "  9) Apply firewall rules"
+    echo " 10) Clean firewall rules"
+    echo ""
+    echo "Maintenance"
+    echo " 11) Uninstall"
+    echo " 12) Quit"
+    echo "----------------------------------------"
     local choice
     choice="$(prompt "Select action" "1")"
     case "$choice" in
       1) ACTION="install" ;;
-      2) ACTION="configure" ;;
-      3) ACTION="start" ;;
-      4) ACTION="stop" ;;
-      5) ACTION="restart" ;;
-      6) ACTION="status" ;;
-      7) ACTION="logs" ;;
-      8) ACTION="firewall-apply" ;;
-      9) ACTION="firewall-clean" ;;
-      10) ACTION="uninstall" ;;
-      11) return ;;
+      2) ACTION="update-binary" ;;
+      3) ACTION="configure" ;;
+      4) ACTION="start" ;;
+      5) ACTION="stop" ;;
+      6) ACTION="restart" ;;
+      7) ACTION="status" ;;
+      8) ACTION="logs" ;;
+      9) ACTION="firewall-apply" ;;
+      10) ACTION="firewall-clean" ;;
+      11) ACTION="uninstall" ;;
+      12) return ;;
       *) die "Invalid selection." ;;
     esac
 
@@ -576,19 +622,21 @@ ensure_package() {
   fi
 
   set_default_package_url
-  if [ "$ROLE" = "client" ]; then
-    if ! download_to_dir "$PACKAGE_URL" "$tmp_dir"; then
-      if ! download_from_github_latest "$tmp_dir"; then
+  if ! download_from_github_latest "$tmp_dir"; then
+    if [ "$ROLE" = "client" ]; then
+      echo "GitHub download failed."
+      echo "Offline installation is recommended to avoid version mismatch."
+      local use_mirror
+      use_mirror="$(prompt_yes_no "Use mirror download anyway? (yes/no)" "no")"
+      if [ "$use_mirror" != "yes" ]; then
         rm -rf "$tmp_dir"
-        die "Download failed from mirror and GitHub."
+        die "Download cancelled. Provide --local-archive to install offline."
       fi
+      echo "Warning: Iran using mirrors while Kharej uses GitHub can cause version mismatch."
     fi
-  else
-    if ! download_from_github_latest "$tmp_dir"; then
-      if ! download_to_dir "$PACKAGE_URL" "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-        die "Download failed from GitHub and mirror."
-      fi
+    if ! download_to_dir "$PACKAGE_URL" "$tmp_dir"; then
+      rm -rf "$tmp_dir"
+      die "Download failed from GitHub and mirror."
     fi
   fi
 
@@ -722,6 +770,49 @@ install_from_archive() {
       cp -a "$extract_dir/README.md" /root/paqet-hub/
     fi
   fi
+
+  rm -rf "$tmp_dir"
+}
+
+get_paqet_version() {
+  local bin_path="/root/paqet-hub/paqet_linux_amd64"
+  if [ -x "$bin_path" ]; then
+    "$bin_path" version 2>/dev/null | awk -F': ' '/^Version:/ {print $2; exit}'
+  fi
+}
+
+update_binary_from_archive() {
+  local archive_path="$1"
+  [ -f "$archive_path" ] || die "Archive not found: $archive_path"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local extract_dir
+  extract_dir="$tmp_dir/extract"
+  mkdir -p "$extract_dir"
+  tar -xzvf "$archive_path" -C "$extract_dir"
+
+  local src_bin
+  if [ -f "$extract_dir/root/paqet-hub/paqet_linux_amd64" ]; then
+    src_bin="$extract_dir/root/paqet-hub/paqet_linux_amd64"
+  elif [ -f "$extract_dir/paqet_linux_amd64" ]; then
+    src_bin="$extract_dir/paqet_linux_amd64"
+  else
+    src_bin="$(find "$extract_dir" -type f -name 'paqet_linux_amd64' | head -n1)"
+  fi
+
+  if [ -z "$src_bin" ]; then
+    rm -rf "$tmp_dir"
+    die "paqet_linux_amd64 not found in archive."
+  fi
+
+  mkdir -p /root/paqet-hub
+  local dest_bin="/root/paqet-hub/paqet_linux_amd64"
+  if [ -f "$dest_bin" ]; then
+    mv "$dest_bin" "$dest_bin.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  cp -a "$src_bin" "$dest_bin"
+  chmod +x "$dest_bin"
 
   rm -rf "$tmp_dir"
 }
@@ -956,6 +1047,9 @@ manage_action() {
     logs)
       journalctl -u paqet -n "$LOG_LINES" -f
       ;;
+    update-binary)
+      update_binary_action
+      ;;
     firewall-apply)
       ensure_role
       if [ "$ROLE" != "server" ]; then
@@ -1038,7 +1132,7 @@ run_action() {
       configure_action
       run_post_config_actions
       ;;
-    start|stop|restart|status|logs|firewall-apply|firewall-clean|uninstall)
+    start|stop|restart|status|logs|firewall-apply|firewall-clean|uninstall|update-binary)
       manage_action
       ;;
     *)
@@ -1079,6 +1173,27 @@ test_connection() {
   return 1
 }
 
+update_binary_action() {
+  require_root
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  if ! download_from_github_latest "$tmp_dir"; then
+    rm -rf "$tmp_dir"
+    die "GitHub download failed."
+  fi
+
+  local file_path
+  file_path="$(ls -1 "$tmp_dir" | head -n1)"
+  if [ -z "$file_path" ]; then
+    rm -rf "$tmp_dir"
+    die "Download failed."
+  fi
+
+  update_binary_from_archive "$tmp_dir/$file_path"
+  rm -rf "$tmp_dir"
+  systemctl restart paqet
+}
+
 run_post_config_actions() {
   if [ "$APPLY_FIREWALL_AFTER_CONFIG" = "true" ] && [ "$ROLE" = "server" ]; then
     firewall_apply
@@ -1098,6 +1213,7 @@ run_post_config_actions() {
 main() {
   parse_args "$@"
   normalize_role
+  show_status_badge
   if [ "$INTERACTIVE" = "true" ]; then
     interactive_menu
     return
