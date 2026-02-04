@@ -157,6 +157,7 @@ Actions:
   firewall-clean  Remove iptables rules (server only)
   view-config     Show current config
   backup-config   Backup current config
+  show-kcp-key    Show KCP key from config
   uninstall       Disable service and remove files
 
 Options:
@@ -368,6 +369,9 @@ validate_config_values() {
     fi
   fi
   is_valid_kcp_key "$KCP_KEY" || die "Invalid KCP key (32-128 chars, no spaces or quotes)."
+  if [ "$ROLE" = "server" ]; then
+    warn "Copy this KCP key and share it with clients."
+  fi
   if [ "$ROLE" = "client" ]; then
     [ -n "$PEER_IP" ] || die "Peer (server) IP is required for client."
     is_valid_ip "$PEER_IP" || die "Invalid peer (server) IP."
@@ -596,6 +600,14 @@ show_navigation_help() {
   echo ""
 }
 
+show_troubleshooting_hint() {
+  echo -e "${YELLOW}Troubleshooting:${NC}"
+  echo "  - Use View Logs to see errors"
+  echo "  - Use View Configuration to inspect config.yaml"
+  echo "  - Use Backup Configuration before changes"
+  echo ""
+}
+
 quick_install_guided() {
   echo -e "${BOLD}Quick Install - Step by Step${NC}"
 
@@ -669,11 +681,13 @@ interactive_menu() {
     echo -e "${CYAN}Maintenance${NC}"
     echo " 13) View Configuration"
     echo " 14) Backup Configuration"
-    echo " 15) Uninstall"
+    echo " 15) View KCP Key"
+    echo " 16) Uninstall"
     echo ""
     echo "  0) Quit"
     echo -e "${BOLD}+--------------------------------------+${NC}"
     show_navigation_help
+    show_troubleshooting_hint
     local choice
     choice="$(prompt "Select action" "1")"
     case "$choice" in
@@ -691,7 +705,8 @@ interactive_menu() {
       12|test) ACTION="test" ;;
       13|view|view-config) ACTION="view-config" ;;
       14|backup|backup-config) ACTION="backup-config" ;;
-      15|uninstall) ACTION="uninstall" ;;
+      15|kcp|key|kcp-key) ACTION="show-kcp-key" ;;
+      16|uninstall) ACTION="uninstall" ;;
       0|q|quit|exit) return ;;
       help|h) usage; continue ;;
       *) die "Invalid selection." ;;
@@ -1036,6 +1051,10 @@ install_from_archive() {
   local archive_path="$1"
   [ -f "$archive_path" ] || die "Archive not found: $archive_path"
 
+  if systemctl is-active --quiet paqet 2>/dev/null; then
+    systemctl stop paqet
+  fi
+
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   local extract_dir
@@ -1059,7 +1078,8 @@ install_from_archive() {
   else
     mkdir -p /root/paqet-hub
     if [ -f "$extract_dir/paqet_linux_amd64" ]; then
-      cp -a "$extract_dir/paqet_linux_amd64" /root/paqet-hub/
+      cp -a "$extract_dir/paqet_linux_amd64" /root/paqet-hub/paqet_linux_amd64.new
+      mv -f /root/paqet-hub/paqet_linux_amd64.new /root/paqet-hub/paqet_linux_amd64
     fi
     if [ -d "$extract_dir/example" ]; then
       cp -a "$extract_dir/example" /root/paqet-hub/
@@ -1180,6 +1200,10 @@ update_binary_from_archive() {
   local archive_path="$1"
   [ -f "$archive_path" ] || die "Archive not found: $archive_path"
 
+  if systemctl is-active --quiet paqet 2>/dev/null; then
+    systemctl stop paqet
+  fi
+
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   local extract_dir
@@ -1206,7 +1230,8 @@ update_binary_from_archive() {
   if [ -f "$dest_bin" ]; then
     mv "$dest_bin" "$dest_bin.bak.$(date +%Y%m%d%H%M%S)"
   fi
-  cp -a "$src_bin" "$dest_bin"
+  cp -a "$src_bin" "$dest_bin.new"
+  mv -f "$dest_bin.new" "$dest_bin"
   chmod +x "$dest_bin"
 
   rm -rf "$tmp_dir"
@@ -1484,6 +1509,9 @@ manage_action() {
     backup-config)
       backup_config_action
       ;;
+    show-kcp-key)
+      show_kcp_key_action
+      ;;
     update-binary)
       update_binary_action
       ;;
@@ -1527,6 +1555,20 @@ backup_config_action() {
     success "Backup created for $CONFIG_PATH"
   else
     warn "Config file not found at $CONFIG_PATH"
+  fi
+}
+
+show_kcp_key_action() {
+  if [ ! -f "$CONFIG_PATH" ]; then
+    warn "Config file not found at $CONFIG_PATH"
+    return
+  fi
+  local key
+  key="$(awk -F'"' '/^[ \t]*key:[ \t]*"/ {print $2; exit}' "$CONFIG_PATH")"
+  if [ -n "$key" ]; then
+    echo -e "${BOLD}KCP key:${NC} ${CYAN}$key${NC}"
+  else
+    warn "KCP key not found in $CONFIG_PATH"
   fi
 }
 
@@ -1592,7 +1634,7 @@ run_action() {
       configure_action
       run_post_config_actions
       ;;
-    start|stop|restart|status|logs|firewall-apply|firewall-clean|uninstall|update-binary|test|view-config|backup-config)
+    start|stop|restart|status|logs|firewall-apply|firewall-clean|uninstall|update-binary|test|view-config|backup-config|show-kcp-key)
       manage_action
       ;;
     *)
