@@ -140,7 +140,7 @@ Actions:
 
 Options:
   --role client|server   Required for install/configure (client=Iran, server=Kharej)
-  --local-archive PATH   Use local tar.gz instead of downloading
+  --local-archive PATH   Use local archive (.zip, .tar.gz, .tar) instead of downloading
   --package-url URL      Override package URL for install
   --checksum VALUE       Verify sha256/sha512 of archive (64 or 128 hex)
   --no-download          Skip download/extract (use existing /root/paqet-hub)
@@ -516,7 +516,7 @@ prompt_yes_no() {
 prompt_archive_path() {
   local path
   while :; do
-    path="$(prompt "Local archive path (empty to download)" "")"
+    path="$(prompt "Local archive path (.zip, .tar.gz, .tar; empty to download)" "")"
     if [ -z "$path" ]; then
       echo ""
       return 0
@@ -1020,7 +1020,14 @@ install_from_archive() {
   local extract_dir
   extract_dir="$tmp_dir/extract"
   mkdir -p "$extract_dir"
-  tar -xzvf "$archive_path" -C "$extract_dir" || die "Failed to extract archive."
+  if [[ "$archive_path" =~ \.zip$ ]]; then
+    if ! command -v unzip >/dev/null 2>&1; then
+      die "unzip is required to extract .zip archives."
+    fi
+    unzip -q "$archive_path" -d "$extract_dir" || die "Failed to extract archive."
+  else
+    tar -xzvf "$archive_path" -C "$extract_dir" || die "Failed to extract archive."
+  fi
 
   if [ -d "$extract_dir/root/paqet-hub" ]; then
     mkdir -p /root
