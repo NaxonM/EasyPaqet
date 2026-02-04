@@ -29,6 +29,8 @@ easyPaqet simplifies the deployment and management of Paqet tunnels, providing a
 - Support for local archives (offline installation)
 - Service management commands
 - Built-in connection testing
+- Startup status badge (install state, service state, version)
+- Update Paqet binary from GitHub
 
 ---
 
@@ -78,7 +80,7 @@ Using automatic download:
 ./easyPaqet install --role client
 ```
 
-Downloads attempt mirror first, then GitHub as fallback.
+Downloads attempt GitHub first. If GitHub fails on Iran, the script prompts before using mirrors and warns about potential version mismatch.
 
 #### Kharej Server
 
@@ -116,6 +118,8 @@ The wizard will guide you through:
 4. **Firewall Setup** - Optional firewall rule configuration (Kharej only)
 5. **Service Management** - Start service and run connection tests (Iran only)
 
+On startup, the script displays a status badge showing install state, service state, and the detected binary version. The config confirmation also shows the current binary version when available.
+
 ### Management Commands
 
 Control your Paqet service with these commands:
@@ -131,6 +135,9 @@ Control your Paqet service with these commands:
 # Firewall Management
 ./easyPaqet firewall-apply --role server --port <PAQET_PORT>
 ./easyPaqet firewall-clean --role server --port <PAQET_PORT>
+
+# Binary Update
+./easyPaqet update-binary # Download and replace the Paqet binary from GitHub
 
 # Uninstall
 ./easyPaqet uninstall      # Remove Paqet and clean up
