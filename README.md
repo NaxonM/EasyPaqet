@@ -24,13 +24,17 @@ easyPaqet simplifies the deployment and management of Paqet tunnels, providing a
 ### Features
 
 - One-line installation
+- Quick install guided flow
 - Interactive configuration wizard
 - Automated firewall management
+- Firewall rules persistence (iptables-save)
 - Support for local archives (offline installation)
 - Service management commands
 - Built-in connection testing
 - Startup status badge (install state, service state, version)
 - Update Paqet binary from GitHub
+- Custom download URL fallback
+- Checksum verification (sha256/sha512)
 
 ---
 
@@ -80,7 +84,7 @@ Using automatic download:
 ./easyPaqet install --role client
 ```
 
-Downloads attempt GitHub first. If GitHub fails on Iran, the script prompts before using mirrors and warns about potential version mismatch.
+Downloads attempt GitHub first. If GitHub fails, the script offers a custom URL or local archive.
 
 #### Kharej Server
 
@@ -96,7 +100,7 @@ Using automatic download:
 ./easyPaqet install --role server
 ```
 
-Downloads attempt GitHub first, then mirror as fallback.
+Downloads attempt GitHub first. If GitHub fails, the script offers a custom URL or local archive.
 
 ---
 
@@ -118,7 +122,24 @@ The wizard will guide you through:
 4. **Firewall Setup** - Optional firewall rule configuration (Kharej only)
 5. **Service Management** - Start service and run connection tests (Iran only)
 
+For KCP keys, install on Kharej first. The wizard will generate a random key on the server and show it so you can paste it on Iran.
+
 On startup, the script displays a status badge showing install state, service state, and the detected binary version. The config confirmation also shows the current binary version when available.
+
+### Quick Install (Guided)
+
+Use the guided flow for a step-by-step setup:
+
+```bash
+./easyPaqet
+```
+
+Then choose:
+
+- Quick Install (Guided)
+- Pick role (server first, then client)
+- Choose download method or local archive
+- Enter network settings and KCP key (server generates it)
 
 ### Management Commands
 
@@ -136,8 +157,18 @@ Control your Paqet service with these commands:
 ./easyPaqet firewall-apply --role server --port <PAQET_PORT>
 ./easyPaqet firewall-clean --role server --port <PAQET_PORT>
 
+# Test
+./easyPaqet test
+
+# View/Backup Config
+./easyPaqet view-config
+./easyPaqet backup-config
+
 # Binary Update
 ./easyPaqet update-binary # Download and replace the Paqet binary from GitHub
+
+# Checksum Verification
+./easyPaqet install --role server --checksum <SHA256_OR_SHA512>
 
 # Uninstall
 ./easyPaqet uninstall      # Remove Paqet and clean up
@@ -213,6 +244,8 @@ A successful connection through the SOCKS5 proxy indicates proper tunnel operati
 ## Deployment Guide
 
 ### Deployment Workflow
+
+Install Kharej first so it can generate the KCP key. Then install Iran and paste the key.
 
 #### Iran VPS Setup (Client)
 
