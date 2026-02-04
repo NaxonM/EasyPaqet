@@ -30,6 +30,7 @@ PURGE="false"
 USE_COLOR="true"
 CLEAR_SCREEN="true"
 SERVER_IP=""
+WARNED_KCP="false"
 
 init_colors() {
   if [ "$USE_COLOR" != "true" ] || [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
@@ -198,29 +199,6 @@ EOF
 die() {
   echo "" >&2
   error "$*"
-  echo "" >&2
-  echo -e "${BOLD}Troubleshooting:${NC}" >&2
-  case "$*" in
-    *"download"*)
-      echo "  - Check your internet connection" >&2
-      echo "  - Try --local-archive with a local file" >&2
-      echo "  - Verify the package URL is correct" >&2
-      ;;
-    *"checksum"*)
-      echo "  - The downloaded file may be corrupted" >&2
-      echo "  - Try downloading again" >&2
-      echo "  - Verify the checksum value is correct" >&2
-      ;;
-    *"interface"*)
-      echo "  - List interfaces: ip link show" >&2
-      echo "  - Use --iface to specify manually" >&2
-      ;;
-    *"KCP key"*)
-      echo "  - Server: key is auto-generated during configuration" >&2
-      echo "  - Client: paste the key from the server" >&2
-      echo "  - Key must be 32-128 characters, no spaces or quotes" >&2
-      ;;
-  esac
   exit 1
 }
 
@@ -369,13 +347,14 @@ validate_config_values() {
     fi
   fi
   is_valid_kcp_key "$KCP_KEY" || die "Invalid KCP key (32-128 chars, no spaces or quotes)."
-  if [ "$ROLE" = "server" ]; then
-    warn "Copy this KCP key and share it with clients."
-  fi
   if [ "$ROLE" = "client" ]; then
     [ -n "$PEER_IP" ] || die "Peer (server) IP is required for client."
     is_valid_ip "$PEER_IP" || die "Invalid peer (server) IP."
     is_valid_port "$SOCKS_PORT" || die "Invalid socks port."
+  fi
+  if [ "$ROLE" = "server" ] && [ "$INTERACTIVE" != "true" ] && [ "$WARNED_KCP" = "false" ]; then
+    warn "Copy this KCP key and share it with clients."
+    WARNED_KCP="true"
   fi
 }
 
@@ -472,6 +451,10 @@ collect_config_prompts() {
       KCP_KEY="$(generate_kcp_key)"
       info "Generated KCP key for server: $KCP_KEY"
     fi
+    if [ "$WARNED_KCP" = "false" ]; then
+      warn "Copy this KCP key and share it with clients."
+      WARNED_KCP="true"
+    fi
   else
     while :; do
       KCP_KEY="$(prompt "KCP key (from server)" "")"
@@ -507,6 +490,19 @@ collect_config_prompts() {
 }
 
 prompt_config_flow() {
+  if [ "$INTERACTIVE" = "true" ]; then
+    local default_role
+    if [ "$ROLE" = "client" ] || [ "$ROLE" = "server" ]; then
+      default_role="$ROLE"
+    else
+      default_role="client"
+    fi
+    ROLE="$(prompt "Role (client=Iran / server=Kharej)" "$default_role")"
+    normalize_role
+  fi
+  if [ "$ROLE" != "client" ] && [ "$ROLE" != "server" ]; then
+    die "--role client|server is required."
+  fi
   while :; do
     collect_config_prompts
     validate_config_values
