@@ -490,7 +490,7 @@ collect_config_prompts() {
 }
 
 prompt_config_flow() {
-  if [ "$INTERACTIVE" = "true" ]; then
+  if [ "$INTERACTIVE" = "true" ] && [ "$ROLE" != "client" ] && [ "$ROLE" != "server" ]; then
     local default_role
     if [ "$ROLE" = "client" ] || [ "$ROLE" = "server" ]; then
       default_role="$ROLE"
