@@ -1361,8 +1361,24 @@ replace_line() {
 replace_addr_block() {
   local key="$1"
   local addr_value="$2"
-  awk -v key="$key" -v addr="  addr: \"$addr_value\"" '
-    $1 == key":" {print; getline; print addr; next}
+  awk -v key="$key" -v addr_val="$addr_value" '
+    $1 == key":" {
+      key_indent = ""
+      if (match($0, /^[ \t]+/)) {
+        key_indent = substr($0, RSTART, RLENGTH)
+      }
+      print key_indent key ":"
+      if (getline) {
+        indent = ""
+        if (match($0, /^[ \t]+/)) {
+          indent = substr($0, RSTART, RLENGTH)
+        } else {
+          indent = key_indent "  "
+        }
+        print indent "addr: \"" addr_val "\""
+        next
+      }
+    }
     {print}
   ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 }
