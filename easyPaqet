@@ -905,25 +905,40 @@ download_to_dir() {
   local out_file="$dir/package.tar.gz"
   local tmp_file="$dir/package.tar.gz.part"
   rm -f "$tmp_file"
-  if command -v curl >/dev/null 2>&1; then
-    local curl_args=("-fL" "--retry" "3" "--retry-delay" "2" "-o" "$tmp_file")
-    if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
-      curl_args+=("--max-time" "$DOWNLOAD_TIMEOUT")
+  local success="false"
+  while [ "$success" = "false" ]; do
+    if command -v curl >/dev/null 2>&1; then
+      local curl_args=("-fL" "-o" "$tmp_file")
+      if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
+        curl_args+=("--max-time" "$DOWNLOAD_TIMEOUT")
+      fi
+      if curl "${curl_args[@]}" "$url"; then
+        success="true"
+      else
+        rm -f "$tmp_file"
+        local retry
+        retry="$(prompt_yes_no "Download failed. Retry? (yes/no)" "no")"
+        if [ "$retry" != "yes" ]; then
+          return 1
+        fi
+      fi
+    else
+      local wget_args=("-O" "$tmp_file")
+      if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
+        wget_args+=("--timeout=$DOWNLOAD_TIMEOUT")
+      fi
+      if wget "${wget_args[@]}" "$url"; then
+        success="true"
+      else
+        rm -f "$tmp_file"
+        local retry
+        retry="$(prompt_yes_no "Download failed. Retry? (yes/no)" "no")"
+        if [ "$retry" != "yes" ]; then
+          return 1
+        fi
+      fi
     fi
-    if ! curl "${curl_args[@]}" "$url"; then
-      rm -f "$tmp_file"
-      return 1
-    fi
-  else
-    local wget_args=("-O" "$tmp_file")
-    if [ "$DOWNLOAD_TIMEOUT" != "0" ]; then
-      wget_args+=("--timeout=$DOWNLOAD_TIMEOUT")
-    fi
-    if ! wget "${wget_args[@]}" "$url"; then
-      rm -f "$tmp_file"
-      return 1
-    fi
-  fi
+  done
   if [ ! -s "$tmp_file" ]; then
     rm -f "$tmp_file"
     return 1
