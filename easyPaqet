@@ -29,6 +29,7 @@ RUN_TEST_AFTER_CONFIG="false"
 PURGE="false"
 USE_COLOR="true"
 CLEAR_SCREEN="true"
+SERVER_IP=""
 
 init_colors() {
   if [ "$USE_COLOR" != "true" ] || [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
@@ -71,6 +72,11 @@ show_status_badge() {
   local installed="no"
   local running="no"
   local version="not installed"
+  local server_ip_label="unknown"
+
+  if [ -n "$SERVER_IP" ]; then
+    server_ip_label="$SERVER_IP"
+  fi
 
   if [ -x "$bin_path" ]; then
     installed="yes"
@@ -102,7 +108,22 @@ show_status_badge() {
   echo -e "| Installed: $installed_label"
   echo -e "| Status:    $running_label"
   echo -e "| Version:   ${CYAN}$version${NC}"
+  echo -e "| Server IP: ${CYAN}$server_ip_label${NC}"
   echo -e "${BOLD}+--------------------------------------+${NC}"
+}
+
+fetch_public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    ip="$(wget -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    SERVER_IP="$ip"
+  else
+    SERVER_IP=""
+  fi
 }
 
 prompt() {
@@ -1026,7 +1047,7 @@ install_from_archive() {
     fi
     unzip -q "$archive_path" -d "$extract_dir" || die "Failed to extract archive."
   else
-    tar -xzvf "$archive_path" -C "$extract_dir" || die "Failed to extract archive."
+    tar -xzf "$archive_path" -C "$extract_dir" || die "Failed to extract archive."
   fi
 
   if [ -d "$extract_dir/root/paqet-hub" ]; then
@@ -1164,7 +1185,7 @@ update_binary_from_archive() {
   local extract_dir
   extract_dir="$tmp_dir/extract"
   mkdir -p "$extract_dir"
-  tar -xzvf "$archive_path" -C "$extract_dir"
+  tar -xzf "$archive_path" -C "$extract_dir"
 
   local src_bin
   if [ -f "$extract_dir/root/paqet-hub/paqet_linux_amd64" ]; then
@@ -1406,7 +1427,9 @@ install_action() {
 
   info "[4/5] Finalizing..."
   success "Installation complete."
-  show_installation_summary
+  if [ "$INTERACTIVE" != "true" ]; then
+    show_installation_summary
+  fi
 }
 
 configure_action() {
@@ -1618,8 +1641,6 @@ test_connection() {
 
 show_installation_summary() {
   echo ""
-  success "Installation complete."
-  echo ""
   echo -e "${BOLD}Next steps:${NC}"
   if [ "$ROLE" = "server" ]; then
     echo "  1) Share this KCP key with clients:"
@@ -1668,7 +1689,7 @@ run_post_config_actions() {
     systemctl restart paqet
   fi
   sleep 3
-  if [ "$ROLE" = "client" ]; then
+  if [ "$ROLE" = "client" ] && [ "$RUN_TEST_AFTER_CONFIG" = "true" ]; then
     test_connection
   elif [ "$RUN_TEST_AFTER_CONFIG" = "true" ]; then
     systemctl status paqet --no-pager
@@ -1677,6 +1698,7 @@ run_post_config_actions() {
 
 main() {
   init_colors
+  fetch_public_ip
   parse_args "$@"
   normalize_role
   show_status_badge
