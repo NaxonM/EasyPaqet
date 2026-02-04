@@ -777,7 +777,7 @@ install_from_archive() {
 get_paqet_version() {
   local bin_path="/root/paqet-hub/paqet_linux_amd64"
   if [ -x "$bin_path" ]; then
-    "$bin_path" version 2>/dev/null | awk -F': ' '/^Version:/ {print $2; exit}'
+    "$bin_path" version 2>/dev/null | awk -F': ' '/^Version:/ {print $2; exit}' || true
   fi
 }
 
